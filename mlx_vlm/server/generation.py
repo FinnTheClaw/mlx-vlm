@@ -152,8 +152,13 @@ def _run_chunked_speculative_prefill(
     *,
     prefill_step_size: Optional[int],
     generation_stream,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> Tuple[object, mx.array]:
     """Prefill target cache in chunks, capturing speculative state only at end."""
+    started = time.perf_counter()
+    processed_columns = 0
+    if callable(progress_callback):
+        progress_callback(processed_columns, 0.0)
     remaining_input_ids = input_ids
     remaining_embeds = inputs_embeds
     remaining_kwargs = dict(prompt_kwargs or {})
@@ -182,6 +187,12 @@ def _run_chunked_speculative_prefill(
                     **chunk_kwargs,
                 )
             mx.eval([c.state for c in prompt_cache])
+            processed_columns += n_to_process
+            if callable(progress_callback):
+                progress_callback(
+                    processed_columns,
+                    max(0.0, time.perf_counter() - started),
+                )
             remaining_input_ids = remaining_input_ids[:, n_to_process:]
             remaining_embeds = remaining_embeds[:, n_to_process:]
             remaining_kwargs = _drop_prefill_kwargs(
@@ -408,6 +419,186 @@ class ServerMetricsStore:
         self._decode_time_total_s = 0.0
         self._last_request_at: Optional[float] = None
         self._last_error: Optional[dict] = None
+        self._active_requests: dict[str, dict] = {}
+        self._active_request_seq = 0
+
+    def register_active_request(
+        self,
+        *,
+        request_id: Optional[str],
+        model: str,
+        prompt_tokens: int,
+    ) -> str:
+        """Register request-owned telemetry before backend queue admission."""
+        now = time.time()
+        with self._lock:
+            self._active_request_seq += 1
+            telemetry_key = f"active-{self._active_request_seq}"
+            public_request_id = f"mlxreq-{self._active_request_seq}"
+            self._active_requests[telemetry_key] = {
+                "telemetry_key": telemetry_key,
+                "request_id": public_request_id,
+                "upstream_request_id": request_id,
+                "request_id_source": (
+                    "x-finn-request-id" if request_id else "mlx-generated"
+                ),
+                "uid": None,
+                "model": model,
+                "status": "queued",
+                "queued_at": now,
+                "started_at": now,
+                "prefill_started_at": None,
+                "first_token_at": None,
+                "last_token_at": None,
+                "updated_at": now,
+                "prompt_tokens_total": max(0, int(prompt_tokens or 0)),
+                "prompt_tokens_processed": 0,
+                "prompt_tokens_computed": 0,
+                "cached_tokens": 0,
+                "prefill_elapsed_s": 0.0,
+                "prefill_tok_s": None,
+                "prefill_tok_s_avg": None,
+                "prefill_tok_s_inst": None,
+                "prefill_complete": False,
+                "prefill_window_ready": False,
+                "generated_tokens": 0,
+                "decode_elapsed_s": 0.0,
+                "decode_tok_s": None,
+                "decode_tok_s_avg": None,
+                "decode_tok_s_inst": None,
+                "decode_window_ready": False,
+                "token_count_source": "model_token_ids",
+                "exact_generation_tokens": True,
+                "telemetry_schema_version": 1,
+                "_prefill_computed_prev": 0,
+                "_prefill_elapsed_prev": 0.0,
+                "_decode_rate_tokens": 0,
+                "_decode_compute_s": 0.0,
+            }
+            return telemetry_key
+
+    def bind_active_request(self, telemetry_key: str, uid: int) -> None:
+        with self._lock:
+            row = self._active_requests.get(telemetry_key)
+            if row is None:
+                return
+            row["uid"] = int(uid)
+            row["updated_at"] = time.time()
+
+    def record_active_prompt_progress(
+        self,
+        telemetry_key: str,
+        *,
+        prompt_tokens: int,
+        prompt_tokens_processed: int,
+        cached_tokens: int,
+        prefill_elapsed_s: float,
+        prefill_tok_s: Optional[float],
+        prefill_window_ready: bool,
+        prompt_tokens_computed: Optional[int] = None,
+        prefill_complete: Optional[bool] = None,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            row = self._active_requests.get(telemetry_key)
+            if row is None:
+                return
+            total = max(0, int(prompt_tokens or row["prompt_tokens_total"] or 0))
+            processed = min(total, max(0, int(prompt_tokens_processed or 0)))
+            cached = min(processed, max(0, int(cached_tokens or 0)))
+            computed = max(
+                0,
+                int(
+                    prompt_tokens_computed
+                    if prompt_tokens_computed is not None
+                    else processed - cached
+                ),
+            )
+            elapsed = max(0.0, float(prefill_elapsed_s or 0.0))
+            previous_computed = int(row.get("_prefill_computed_prev") or 0)
+            previous_elapsed = float(row.get("_prefill_elapsed_prev") or 0.0)
+            delta_computed = max(0, computed - previous_computed)
+            delta_elapsed = max(0.0, elapsed - previous_elapsed)
+            instant_rate = (
+                delta_computed / delta_elapsed
+                if delta_computed > 0 and delta_elapsed > 0
+                else None
+            )
+            if row.get("prefill_started_at") is None:
+                row["prefill_started_at"] = max(row["queued_at"], now - elapsed)
+            is_complete = (
+                bool(prefill_complete)
+                if prefill_complete is not None
+                else bool(total and processed >= total)
+            )
+            average_rate = (
+                float(prefill_tok_s)
+                if prefill_tok_s is not None and prefill_tok_s > 0
+                else None
+            )
+            row.update(
+                {
+                    "status": "generating" if is_complete else "prefilling",
+                    "prompt_tokens_total": total,
+                    "prompt_tokens_processed": processed,
+                    "prompt_tokens_computed": computed,
+                    "cached_tokens": cached,
+                    "prefill_elapsed_s": elapsed,
+                    "prefill_tok_s": average_rate,
+                    "prefill_tok_s_avg": average_rate,
+                    "prefill_tok_s_inst": (
+                        instant_rate
+                        if instant_rate is not None
+                        else row.get("prefill_tok_s_inst")
+                    ),
+                    "prefill_complete": is_complete,
+                    "prefill_window_ready": bool(prefill_window_ready),
+                    "updated_at": now,
+                    "_prefill_computed_prev": computed,
+                    "_prefill_elapsed_prev": elapsed,
+                }
+            )
+
+    def record_active_generation_tokens(
+        self,
+        telemetry_key: str,
+        *,
+        count: int,
+        decode_compute_s: float,
+    ) -> None:
+        count = max(0, int(count or 0))
+        if count <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            row = self._active_requests.get(telemetry_key)
+            if row is None:
+                return
+            if row.get("first_token_at") is None:
+                row["first_token_at"] = now
+            row["generated_tokens"] += count
+            compute_s = max(0.0, float(decode_compute_s or 0.0))
+            if compute_s > 0:
+                row["_decode_rate_tokens"] += count
+            row["_decode_compute_s"] += compute_s
+            row["decode_elapsed_s"] = row["_decode_compute_s"]
+            row["decode_tok_s"] = (
+                row["_decode_rate_tokens"] / row["_decode_compute_s"]
+                if row["_decode_compute_s"] > 0
+                else None
+            )
+            row["decode_tok_s_avg"] = row["decode_tok_s"]
+            row["decode_tok_s_inst"] = count / compute_s if compute_s > 0 else None
+            row["decode_window_ready"] = bool(row["decode_tok_s"] is not None)
+            row["status"] = "generating"
+            row["last_token_at"] = now
+            row["updated_at"] = now
+
+    def retire_active_request(self, telemetry_key: Optional[str]) -> None:
+        if not telemetry_key:
+            return
+        with self._lock:
+            self._active_requests.pop(telemetry_key, None)
 
     def begin_request(self, *, endpoint: str, model: str, stream: bool):
         del endpoint, model
@@ -468,9 +659,30 @@ class ServerMetricsStore:
                 dict(self._last_error) if self._last_error is not None else None
             )
             last_request_at = self._last_request_at
+            now = time.time()
+            active_requests = []
+            for source in sorted(
+                self._active_requests.values(),
+                key=lambda row: (
+                    row.get("queued_at") or 0,
+                    row.get("telemetry_key") or "",
+                ),
+            ):
+                row = {
+                    key: value
+                    for key, value in source.items()
+                    if not key.startswith("_") and key != "telemetry_key"
+                }
+                row["queue_elapsed_s"] = max(
+                    0.0,
+                    (source.get("prefill_started_at") or now)
+                    - (source.get("queued_at") or now),
+                )
+                active_requests.append(row)
             return {
                 "latest": latest,
                 "recent": recent,
+                "active_requests": active_requests,
                 "summary": {
                     "uptime_s": max(0.0, time.time() - self.started_at),
                     "requests_started": self._requests_started,
@@ -641,6 +853,9 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+    # Stable upstream correlation identity used only for server telemetry.
+    # It is deliberately excluded from model kwargs and prompt templates.
+    telemetry_request_id: Optional[str] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -748,7 +963,9 @@ class StreamingToken:
     token_count: int = 1
 
 
-def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
+def _diffusion_block_chunks(
+    results, observer: Optional[Callable[[object], None]] = None
+) -> "Generator[StreamingToken, None, None]":
     """Group diffusion engine results into block-by-block streaming tokens.
 
     The diffusion engine emits a canvas's tokens right after that canvas
@@ -762,6 +979,8 @@ def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
     for result in results:
         if result.is_draft:
             continue
+        if callable(observer):
+            observer(result)
         if result.text:
             block_text.append(result.text)
         if result.token is not None:
@@ -997,11 +1216,26 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
+        register = getattr(runtime.metrics, "register_active_request", None)
+        telemetry_key = (
+            register(
+                request_id=args.telemetry_request_id,
+                model=getattr(self, "model_path", "unknown"),
+                prompt_tokens=prompt_tokens,
+            )
+            if callable(register)
+            else None
+        )
+        rqueue._mlx_telemetry_key = telemetry_key
+
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
         if isinstance(ctx, Exception):
+            retire = getattr(runtime.metrics, "retire_active_request", None)
+            if callable(retire):
+                retire(telemetry_key)
             raise ctx
 
         return ctx, _TokenIterator(
@@ -1228,6 +1462,7 @@ class ResponseGenerator:
         active: dict = {}
 
         while not self._stop:
+            new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
@@ -1255,6 +1490,11 @@ class ResponseGenerator:
                         if uid in active:
                             batch_gen.remove(uid)
                             info = active.pop(uid)
+                            retire = getattr(
+                                runtime.metrics, "retire_active_request", None
+                            )
+                            if callable(retire):
+                                retire(info.get("telemetry_key"))
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -1266,6 +1506,7 @@ class ResponseGenerator:
                         batch_gen = None
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                    telemetry_key = getattr(rqueue, "_mlx_telemetry_key", None)
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1285,6 +1526,9 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
+                            prompt_progress_callback=lambda progress: self._record_prompt_progress(
+                                active, progress
+                            ),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1321,12 +1565,19 @@ class ResponseGenerator:
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
+                        retire = getattr(runtime.metrics, "retire_active_request", None)
+                        if callable(retire):
+                            retire(telemetry_key)
                         rqueue.put(e)
                         continue
 
+                    bind = getattr(runtime.metrics, "bind_active_request", None)
+                    if callable(bind):
+                        bind(telemetry_key, uid)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
+                        "telemetry_key": telemetry_key,
                         "streamer": _ServerTokenStreamer(
                             self.tokenizer,
                             make_streaming_detokenizer(self.processor),
@@ -1344,18 +1595,35 @@ class ResponseGenerator:
             except Exception as e:
                 logger.exception("Error in generation thread")
                 for info in list(active.values()):
+                    retire = getattr(runtime.metrics, "retire_active_request", None)
+                    if callable(retire):
+                        retire(info.get("telemetry_key"))
                     try:
                         info["rqueue"].put(e)
                         info["rqueue"].put(None)
                     except Exception:
                         pass
                 active.clear()
+                for pending_item in new_items:
+                    pending_queue = pending_item[0]
+                    retire = getattr(runtime.metrics, "retire_active_request", None)
+                    if callable(retire):
+                        retire(getattr(pending_queue, "_mlx_telemetry_key", None))
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+        retire = getattr(runtime.metrics, "retire_active_request", None)
+        for info in list(active.values()):
+            if callable(retire):
+                retire(info.get("telemetry_key"))
+            try:
+                info["rqueue"].put(None)
+            except Exception:
+                pass
+        active.clear()
 
     def _run_diffusion(self, family: str):
         """GPU thread loop for diffusion models.
@@ -1373,6 +1641,7 @@ class ResponseGenerator:
         uid_counter = 0
         cancelled: set = set()
         while not self._stop:
+            new_items = []
             try:
                 new_items, should_stop = self._collect_pending_requests(active=False)
                 if should_stop:
@@ -1381,9 +1650,21 @@ class ResponseGenerator:
                 for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
                     uid_counter += 1
                     uid = uid_counter
+                    telemetry_key = getattr(rqueue, "_mlx_telemetry_key", None)
+                    bind = getattr(runtime.metrics, "bind_active_request", None)
+                    if callable(bind):
+                        bind(telemetry_key, uid)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     try:
-                        generate_request(uid, rqueue, raw_inputs, args, cancelled)
+                        generate_request(
+                            uid,
+                            rqueue,
+                            raw_inputs,
+                            args,
+                            cancelled,
+                            telemetry_key,
+                            prompt_tokens,
+                        )
                         rqueue.put(None)
                     except Exception as e:
                         logger.exception("Error in diffusion generation")
@@ -1392,13 +1673,30 @@ class ResponseGenerator:
                             rqueue.put(None)
                         except Exception:
                             pass
+                    finally:
+                        retire = getattr(runtime.metrics, "retire_active_request", None)
+                        if callable(retire):
+                            retire(telemetry_key)
                     mx.clear_cache()
             except Exception:
                 logger.exception("Error in diffusion generation thread")
+                retire = getattr(runtime.metrics, "retire_active_request", None)
+                if callable(retire):
+                    for rqueue, *_ in new_items:
+                        retire(getattr(rqueue, "_mlx_telemetry_key", None))
                 mx.clear_cache()
                 gc.collect()
 
-    def _generate_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+    def _generate_diffusion(
+        self,
+        uid,
+        rqueue,
+        raw_inputs,
+        args,
+        cancelled,
+        telemetry_key=None,
+        prompt_tokens=0,
+    ):
         if args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with diffusion models."
@@ -1430,9 +1728,59 @@ class ResponseGenerator:
             skip_special_token_ids=skip_special_token_ids,
             mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
         )
+        observed_tokens = 0
+        observed_decode_elapsed = 0.0
+        prompt_recorded = False
+
+        def observe_result(result):
+            nonlocal observed_tokens, observed_decode_elapsed, prompt_recorded
+            prompt_tps = getattr(result, "prompt_tps", None)
+            prompt_elapsed = (
+                prompt_tokens / prompt_tps
+                if prompt_tokens > 0 and prompt_tps and prompt_tps > 0
+                else 0.0
+            )
+            if not prompt_recorded:
+                record_prompt = getattr(
+                    runtime.metrics, "record_active_prompt_progress", None
+                )
+                if callable(record_prompt):
+                    record_prompt(
+                        telemetry_key,
+                        prompt_tokens=prompt_tokens,
+                        prompt_tokens_processed=prompt_tokens,
+                        prompt_tokens_computed=prompt_tokens,
+                        cached_tokens=0,
+                        prefill_elapsed_s=prompt_elapsed,
+                        prefill_tok_s=prompt_tps,
+                        prefill_complete=True,
+                        prefill_window_ready=bool(prompt_tps),
+                    )
+                prompt_recorded = bool(prompt_tps)
+            generated_tokens = max(0, int(getattr(result, "generation_tokens", 0) or 0))
+            count = max(0, generated_tokens - observed_tokens)
+            generation_tps = getattr(result, "generation_tps", None)
+            decode_elapsed = (
+                generated_tokens / generation_tps
+                if generated_tokens > 0 and generation_tps and generation_tps > 0
+                else observed_decode_elapsed
+            )
+            elapsed_delta = max(0.0, decode_elapsed - observed_decode_elapsed)
+            observed_tokens = max(observed_tokens, generated_tokens)
+            observed_decode_elapsed = max(observed_decode_elapsed, decode_elapsed)
+            record_tokens = getattr(
+                runtime.metrics, "record_active_generation_tokens", None
+            )
+            if count and callable(record_tokens):
+                record_tokens(
+                    telemetry_key,
+                    count=count,
+                    decode_compute_s=elapsed_delta,
+                )
+
         try:
             with wired_limit(self.model, [generation_stream]):
-                for chunk in _diffusion_block_chunks(results):
+                for chunk in _diffusion_block_chunks(results, observer=observe_result):
                     rqueue.put(chunk)
                     if chunk.finish_reason:
                         break
@@ -1443,7 +1791,16 @@ class ResponseGenerator:
         finally:
             results.close()
 
-    def _generate_masked_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+    def _generate_masked_diffusion(
+        self,
+        uid,
+        rqueue,
+        raw_inputs,
+        args,
+        cancelled,
+        telemetry_key=None,
+        prompt_tokens=0,
+    ):
         """Generate with a masked-diffusion text model (llada, nemotron).
 
         The model's own blocking generate loop runs the diffusion; an
@@ -1469,9 +1826,58 @@ class ResponseGenerator:
         gen_stats: dict = {}
         emitted_text = ""
         emitted_tokens = 0
+        telemetry_tokens_seen = 0
+        telemetry_last_at = time.perf_counter()
+        telemetry_prompt_recorded = False
+        telemetry_decode_started = False
 
         def flush(tokens, finish_reason=None):
             nonlocal emitted_text, emitted_tokens
+            nonlocal telemetry_tokens_seen, telemetry_last_at
+            nonlocal telemetry_prompt_recorded, telemetry_decode_started
+            now = time.perf_counter()
+            prompt_time = max(0.0, float(gen_stats.get("prompt_time") or 0.0))
+            prompt_tps = (
+                prompt_tokens / prompt_time
+                if prompt_tokens > 0 and prompt_time > 0
+                else None
+            )
+            if not telemetry_prompt_recorded:
+                record_prompt = getattr(
+                    runtime.metrics, "record_active_prompt_progress", None
+                )
+                if callable(record_prompt):
+                    record_prompt(
+                        telemetry_key,
+                        prompt_tokens=prompt_tokens,
+                        prompt_tokens_processed=prompt_tokens,
+                        prompt_tokens_computed=prompt_tokens,
+                        cached_tokens=0,
+                        prefill_elapsed_s=prompt_time,
+                        prefill_tok_s=prompt_tps,
+                        prefill_complete=True,
+                        prefill_window_ready=bool(prompt_tps),
+                    )
+                telemetry_prompt_recorded = True
+            exact_count = max(len(tokens) - telemetry_tokens_seen, 0)
+            telemetry_tokens_seen = max(len(tokens), telemetry_tokens_seen)
+            if exact_count:
+                record_tokens = getattr(
+                    runtime.metrics, "record_active_generation_tokens", None
+                )
+                if callable(record_tokens):
+                    record_tokens(
+                        telemetry_key,
+                        count=exact_count,
+                        decode_compute_s=max(
+                            0.0,
+                            now
+                            - telemetry_last_at
+                            - (prompt_time if not telemetry_decode_started else 0.0),
+                        ),
+                    )
+                telemetry_decode_started = True
+            telemetry_last_at = now
             text = (
                 tokenizer.decode(tokens, skip_special_tokens=args.skip_special_tokens)
                 if tokens
@@ -1487,7 +1893,6 @@ class ResponseGenerator:
                 delta = "" if finish_reason is None else text
             if not delta and not finish_reason:
                 return
-            prompt_time = gen_stats.get("prompt_time") or 0.0
             rqueue.put(
                 StreamingToken(
                     text=delta,
@@ -1495,9 +1900,7 @@ class ResponseGenerator:
                     logprobs=None,
                     finish_reason=finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9,
-                    prompt_tps=(
-                        input_ids.size / prompt_time if prompt_time > 0 else None
-                    ),
+                    prompt_tps=prompt_tps,
                     token_count=max(len(tokens) - emitted_tokens, 0),
                 )
             )
@@ -1577,6 +1980,7 @@ class ResponseGenerator:
         while not self._stop:
             pending = []
             rqueues = {}
+            telemetry_keys = {}
             try:
                 # --- Phase 1: collect pending requests ---
                 pending, should_stop = self._collect_pending_requests(
@@ -1607,8 +2011,10 @@ class ResponseGenerator:
                 for rqueue, raw_inputs, prompt_tokens, args, images in pending:
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
+                    telemetry_key = getattr(rqueue, "_mlx_telemetry_key", None)
                     uids.append(uid)
                     rqueues[uid] = rqueue
+                    telemetry_keys[uid] = telemetry_key
                     token_lists[uid] = []
                     stream_infos[uid] = {
                         "streamer": _ServerTokenStreamer(
@@ -1620,6 +2026,9 @@ class ResponseGenerator:
                     prompt_tokens_map[uid] = prompt_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
+                    bind = getattr(runtime.metrics, "bind_active_request", None)
+                    if callable(bind):
+                        bind(telemetry_key, uid)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
 
@@ -1657,6 +2066,36 @@ class ResponseGenerator:
                     prefill_step_size = None
 
                 prompt_started = time.perf_counter()
+
+                def record_prefill_progress(processed_columns, elapsed_s):
+                    record_prompt = getattr(
+                        runtime.metrics, "record_active_prompt_progress", None
+                    )
+                    if not callable(record_prompt):
+                        return
+                    for row_index, uid in enumerate(uids):
+                        prompt_tokens = prompt_tokens_map[uid]
+                        processed = min(
+                            prompt_tokens,
+                            max(0, int(processed_columns) - left_padding[row_index]),
+                        )
+                        rate = (
+                            processed / elapsed_s
+                            if processed > 0 and elapsed_s > 0
+                            else None
+                        )
+                        record_prompt(
+                            telemetry_keys.get(uid),
+                            prompt_tokens=prompt_tokens,
+                            prompt_tokens_processed=processed,
+                            prompt_tokens_computed=processed,
+                            cached_tokens=0,
+                            prefill_elapsed_s=elapsed_s,
+                            prefill_tok_s=rate,
+                            prefill_complete=processed >= prompt_tokens,
+                            prefill_window_ready=processed > 0,
+                        )
+
                 out, input_mx = _run_chunked_speculative_prefill(
                     lm,
                     input_mx,
@@ -1666,6 +2105,7 @@ class ResponseGenerator:
                     prefill_kwargs,
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
+                    progress_callback=record_prefill_progress,
                 )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
@@ -1678,6 +2118,7 @@ class ResponseGenerator:
                 )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
+                record_prefill_progress(max_len, prompt_elapsed)
                 for uid in uids:
                     prompt_tokens = prompt_tokens_map[uid]
                     prompt_tps_map[uid] = (
@@ -1688,11 +2129,42 @@ class ResponseGenerator:
 
                 finished_uids = set()
 
+                def retire_cancellations():
+                    if not hasattr(self, "_cancel_lock"):
+                        return
+                    retire = getattr(runtime.metrics, "retire_active_request", None)
+                    for cancelled_uid in self._drain_cancellations():
+                        if (
+                            cancelled_uid not in rqueues
+                            or cancelled_uid in finished_uids
+                        ):
+                            continue
+                        try:
+                            rqueues[cancelled_uid].put(None)
+                        except Exception:
+                            pass
+                        if callable(retire):
+                            retire(telemetry_keys.get(cancelled_uid))
+                        finished_uids.add(cancelled_uid)
+
+                retire_cancellations()
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
+                record_tokens = getattr(
+                    runtime.metrics, "record_active_generation_tokens", None
+                )
                 for j, uid in enumerate(uids):
+                    if uid in finished_uids:
+                        continue
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
+                    if callable(record_tokens):
+                        record_tokens(
+                            telemetry_keys.get(uid),
+                            count=1,
+                            decode_compute_s=0.0,
+                        )
                     is_stop = tok in self.stop_tokens
                     is_max = len(token_lists[uid]) >= max_tokens_map[uid]
                     finish = "stop" if is_stop else "length" if is_max else None
@@ -1709,6 +2181,9 @@ class ResponseGenerator:
                     )
                     if finish is not None:
                         rqueues[uid].put(None)
+                        retire = getattr(runtime.metrics, "retire_active_request", None)
+                        if callable(retire):
+                            retire(telemetry_keys.get(uid))
                         finished_uids.add(uid)
 
                 if len(finished_uids) == len(uids):
@@ -1748,7 +2223,10 @@ class ResponseGenerator:
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
                 )
+                round_started = time.perf_counter()
                 for tok_list, _ in rounds_iter:
+                    round_elapsed = max(0.0, time.perf_counter() - round_started)
+                    retire_cancellations()
                     for j, tok in enumerate(tok_list):
                         if tok is None:
                             continue
@@ -1758,6 +2236,12 @@ class ResponseGenerator:
 
                         token_lists[uid].append(tok)
                         tokens = token_lists[uid]
+                        if callable(record_tokens):
+                            record_tokens(
+                                telemetry_keys.get(uid),
+                                count=1,
+                                decode_compute_s=round_elapsed,
+                            )
 
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
@@ -1777,9 +2261,15 @@ class ResponseGenerator:
 
                         if finish is not None:
                             rqueues[uid].put(None)
+                            retire = getattr(
+                                runtime.metrics, "retire_active_request", None
+                            )
+                            if callable(retire):
+                                retire(telemetry_keys.get(uid))
                             finished_uids.add(uid)
                     if len(finished_uids) == len(uids):
                         break
+                    round_started = time.perf_counter()
 
                 # Log acceptance stats
                 al = drafter.accept_lens
@@ -1806,6 +2296,9 @@ class ResponseGenerator:
                             )
                         )
                         rqueues[uid].put(None)
+                        retire = getattr(runtime.metrics, "retire_active_request", None)
+                        if callable(retire):
+                            retire(telemetry_keys.get(uid))
 
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
@@ -1815,16 +2308,72 @@ class ResponseGenerator:
                 _notify_queues(error_queues.values(), e, None)
                 mx.clear_cache()
                 gc.collect()
+            finally:
+                retire = getattr(runtime.metrics, "retire_active_request", None)
+                if callable(retire):
+                    pending_keys = {
+                        getattr(rqueue, "_mlx_telemetry_key", None)
+                        for rqueue, *_ in pending
+                    }
+                    for telemetry_key in set(telemetry_keys.values()) | pending_keys:
+                        retire(telemetry_key)
+
+    def _record_prompt_progress(self, active, prompt_responses) -> None:
+        for prompt_response in prompt_responses:
+            if prompt_response.uid in active:
+                info = active[prompt_response.uid]
+                info["prompt_tps"] = prompt_response.prompt_tps
+                info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
+                record_prompt = getattr(
+                    runtime.metrics, "record_active_prompt_progress", None
+                )
+                if callable(record_prompt):
+                    record_prompt(
+                        info.get("telemetry_key"),
+                        prompt_tokens=getattr(prompt_response, "prompt_tokens", 0),
+                        prompt_tokens_processed=getattr(
+                            prompt_response, "prompt_tokens_processed", 0
+                        ),
+                        prompt_tokens_computed=getattr(
+                            prompt_response, "prompt_tokens_computed", None
+                        ),
+                        cached_tokens=getattr(prompt_response, "cached_tokens", 0),
+                        prefill_elapsed_s=getattr(prompt_response, "prompt_time", 0.0),
+                        prefill_tok_s=getattr(prompt_response, "prompt_tps", None),
+                        prefill_complete=getattr(
+                            prompt_response, "prefill_complete", None
+                        ),
+                        prefill_window_ready=getattr(
+                            prompt_response, "prefill_window_ready", False
+                        ),
+                    )
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
+        step_started = time.perf_counter()
         prompt_responses, responses = batch_gen.next(**kwargs)
-        for prompt_response in prompt_responses:
-            if prompt_response.uid in active:
-                active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
-                active[prompt_response.uid]["cached_tokens"] = getattr(
-                    prompt_response, "cached_tokens", 0
+        step_elapsed_s = max(0.0, time.perf_counter() - step_started)
+        decode_elapsed_s = max(
+            0.0,
+            float(getattr(batch_gen, "_last_generation_step_time_s", step_elapsed_s)),
+        )
+        self._record_prompt_progress(active, prompt_responses)
+        generated_by_uid: dict[int, int] = {}
+        for response in responses:
+            if response.uid in active and response.token is not None:
+                generated_by_uid[response.uid] = (
+                    generated_by_uid.get(response.uid, 0) + 1
+                )
+        record_tokens = getattr(
+            runtime.metrics, "record_active_generation_tokens", None
+        )
+        if callable(record_tokens):
+            for uid, count in generated_by_uid.items():
+                record_tokens(
+                    active[uid].get("telemetry_key"),
+                    count=count,
+                    decode_compute_s=decode_elapsed_s,
                 )
         if not responses:
             return
@@ -1863,6 +2412,9 @@ class ResponseGenerator:
 
             if r.finish_reason is not None:
                 rqueue.put(None)
+                retire = getattr(runtime.metrics, "retire_active_request", None)
+                if callable(retire):
+                    retire(info.get("telemetry_key"))
                 del active[r.uid]
 
     def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:

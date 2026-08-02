@@ -94,6 +94,7 @@ _count_thinking_tag_tokens = None
 _make_logprob_content = None
 _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
+_TELEMETRY_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 def _runtime_cache_get(key, default=None, *, kind=None):
@@ -102,6 +103,12 @@ def _runtime_cache_get(key, default=None, *, kind=None):
         return cache.get(key, default, kind=kind)
     except TypeError:
         return cache.get(key, default)
+
+
+def _read_telemetry_request_id(request: Request) -> Optional[str]:
+    """Read a bounded upstream correlation ID for metrics-only joins."""
+    value = (request.headers.get("x-finn-request-id") or "").strip()
+    return value if _TELEMETRY_REQUEST_ID_RE.fullmatch(value) else None
 
 
 def _looks_like_audio_reference(value: str) -> bool:
@@ -614,6 +621,7 @@ async def responses_input_tokens_endpoint(request: Request):
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
         )
+        gen_args.telemetry_request_id = _read_telemetry_request_id(request)
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
@@ -780,6 +788,7 @@ async def responses_endpoint(request: Request):
             gen_args = _build_gen_args(
                 openai_request, processor, tenant_id=_read_tenant_id(request)
             )
+            gen_args.telemetry_request_id = _read_telemetry_request_id(request)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         if chat_tools and tool_module is not None:
@@ -1471,6 +1480,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             gen_args = _build_gen_args(
                 request, processor, tenant_id=_read_tenant_id(http_request)
             )
+            gen_args.telemetry_request_id = _read_telemetry_request_id(http_request)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:

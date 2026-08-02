@@ -41,6 +41,7 @@ from .generation import (
     get_kv_quant_scheme,
     get_quantized_kv_bits,
     get_quantized_kv_start,
+    get_prefill_step_size,
     get_server_enable_thinking,
     get_server_max_tokens,
     get_server_thinking_budget,
@@ -153,6 +154,16 @@ def _server_runtime_snapshot() -> dict:
             _infer_tool_parser_from_processor(processor) if processor else None
         ),
         "continuous_batching_enabled": runtime.response_generator is not None,
+        "prefill_step_size": get_prefill_step_size(),
+        "telemetry": {
+            "schema_version": 1,
+            "active_request_feed": True,
+            "request_correlation": "upstream_request_id",
+            "generation_token_count_source": "model_token_ids",
+            "exact_generation_tokens": True,
+            "prefill_rates": ["instant", "average"],
+            "decode_rates": ["instant", "average"],
+        },
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
         "apc": (

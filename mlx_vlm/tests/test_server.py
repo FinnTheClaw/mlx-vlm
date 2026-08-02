@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -22,7 +23,7 @@ import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
-from mlx_vlm.generate import GenerationResult
+from mlx_vlm.generate import GenerationResult, PromptProcessingBatch
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
@@ -519,7 +520,15 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
     gen.draft_kind = "dflash"
     gen.stop_tokens = set()
 
+    metrics = server.ServerMetricsStore()
+    monkeypatch.setattr(server.runtime, "metrics", metrics)
     rqueue = Queue()
+    telemetry_key = metrics.register_active_request(
+        request_id="req_speculative_failure",
+        model="demo",
+        prompt_tokens=1,
+    )
+    rqueue._mlx_telemetry_key = telemetry_key
     pending = [
         (
             rqueue,
@@ -549,6 +558,7 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
 
     assert rqueue.get(timeout=1) is error
     assert rqueue.get(timeout=1) is None
+    assert metrics.snapshot()["active_requests"] == []
 
 
 def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
@@ -1083,7 +1093,9 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, empty_stream=False
+):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
@@ -1099,6 +1111,10 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
     )
+    metrics = server.ServerMetricsStore()
+    record_generation_tokens = MagicMock(wraps=metrics.record_active_generation_tokens)
+    metrics.record_active_generation_tokens = record_generation_tokens
+    monkeypatch.setattr(server.runtime, "metrics", metrics)
 
     specs_iter = iter(request_specs)
 
@@ -1110,6 +1126,11 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen._gpu_embed = fake_gpu_embed
 
     monkeypatch.setattr(server_generation, "_make_cache", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        server_generation,
+        "make_speculative_prompt_cache",
+        lambda *args, **kwargs: [],
+    )
     monkeypatch.setattr(
         server_generation, "_get_draft_block_size_from_env", lambda: None
     )
@@ -1125,7 +1146,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
             self.last_segment = ""
 
         def add_token(self, token):
-            self.last_segment = str(token)
+            self.last_segment = "" if empty_stream else str(token)
 
         def finalize(self):
             pass
@@ -1145,10 +1166,19 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     monkeypatch.setattr(server_generation, "run_speculative_server_rounds", fake_rounds)
 
     args = server.GenerationArguments(max_tokens=2, temperature=0)
-    for spec in request_specs:
+    response_queues = []
+    for index, spec in enumerate(request_specs):
+        rqueue = Queue()
+        telemetry_key = metrics.register_active_request(
+            request_id=f"req_speculative_{index}",
+            model="demo",
+            prompt_tokens=int(spec["input_ids"].shape[1]),
+        )
+        rqueue._mlx_telemetry_key = telemetry_key
+        response_queues.append(rqueue)
         gen.requests.put(
             (
-                Queue(),
+                rqueue,
                 {"input_ids": spec["input_ids"]},
                 int(spec["input_ids"].shape[1]),
                 args,
@@ -1159,6 +1189,9 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen._run_speculative()
     call = lm.calls[0]
     call["round_kwargs"] = gen.round_kwargs
+    call["response_queues"] = response_queues
+    call["generation_token_calls"] = list(record_generation_tokens.call_args_list)
+    call["active_requests"] = metrics.snapshot()["active_requests"]
     return call
 
 
@@ -1179,6 +1212,31 @@ def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
     )
 
     assert call["round_kwargs"]["greedy_sampling"] is True
+
+
+def test_speculative_server_counts_hidden_model_tokens_before_stream_filtering(
+    monkeypatch,
+):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            }
+        ],
+        empty_stream=True,
+    )
+
+    counts = [item.kwargs["count"] for item in call["generation_token_calls"]]
+    assert counts == [1, 1]
+    rqueue = call["response_queues"][0]
+    assert isinstance(rqueue.get(timeout=1), server.GenerationContext)
+    assert rqueue.get(timeout=1).text == ""
+    assert rqueue.get(timeout=1).text == ""
+    assert rqueue.get(timeout=1) is None
+    assert call["active_requests"] == []
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -1244,6 +1302,164 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
     assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
     assert "_apc_image_hash" not in call
     assert "_apc_tenant" not in call
+
+
+def test_diffusion_raw_observer_counts_invisible_tokens_and_skips_drafts(
+    monkeypatch,
+):
+    metrics = server.ServerMetricsStore()
+    monkeypatch.setattr(server.runtime, "metrics", metrics)
+    telemetry_key = metrics.register_active_request(
+        request_id="req_diffusion_hidden",
+        model="demo-diffusion",
+        prompt_tokens=4,
+    )
+    metrics.bind_active_request(telemetry_key, 23)
+
+    def result(
+        *,
+        generation_tokens,
+        text="",
+        token=0,
+        draft=False,
+        block_complete=False,
+        finish_reason=None,
+    ):
+        return SimpleNamespace(
+            is_draft=draft,
+            text=text,
+            token=token,
+            diffusion_block_complete=block_complete,
+            finish_reason=finish_reason,
+            generation_tokens=generation_tokens,
+            generation_tps=20.0,
+            prompt_tps=4.0,
+            peak_memory=1.0,
+        )
+
+    class CloseableResults:
+        def __init__(self, rows):
+            self._rows = rows
+            self.closed = False
+
+        def __iter__(self):
+            return iter(self._rows)
+
+        def close(self):
+            self.closed = True
+
+    results = CloseableResults(
+        [
+            result(generation_tokens=100, draft=True, text="draft", token=90),
+            result(generation_tokens=1, token=11),
+            result(
+                generation_tokens=2,
+                text="visible",
+                token=12,
+                block_complete=True,
+            ),
+            result(generation_tokens=3, token=13, finish_reason="stop"),
+        ]
+    )
+    monkeypatch.setattr(
+        server_generation, "stream_diffusion_generate", lambda *args, **kwargs: results
+    )
+    monkeypatch.setattr(
+        server_generation, "wired_limit", lambda *args, **kwargs: nullcontext()
+    )
+
+    stopping_criteria = SimpleNamespace(reset=MagicMock())
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = object()
+    gen.processor = object()
+    gen.tokenizer = SimpleNamespace(
+        all_special_ids=[], stopping_criteria=stopping_criteria
+    )
+    gen.config = SimpleNamespace(eos_token_id=99)
+    gen._drain_cancellations = lambda: set()
+    rqueue = Queue()
+
+    gen._generate_diffusion(
+        23,
+        rqueue,
+        {"input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32)},
+        server.GenerationArguments(max_tokens=4),
+        set(),
+        telemetry_key,
+        4,
+    )
+
+    live = metrics.snapshot()["active_requests"][0]
+    assert live["generated_tokens"] == 3
+    assert live["prompt_tokens_processed"] == 4
+    assert live["prefill_complete"] is True
+    chunks = [rqueue.get(timeout=1), rqueue.get(timeout=1)]
+    assert [chunk.text for chunk in chunks] == ["visible", ""]
+    assert [chunk.token_count for chunk in chunks] == [2, 1]
+    assert [chunk.finish_reason for chunk in chunks] == [None, "stop"]
+    assert results.closed is True
+
+
+def test_masked_diffusion_telemetry_does_not_double_count_final_flush(monkeypatch):
+    metrics = server.ServerMetricsStore()
+    record_generation_tokens = MagicMock(wraps=metrics.record_active_generation_tokens)
+    metrics.record_active_generation_tokens = record_generation_tokens
+    monkeypatch.setattr(server.runtime, "metrics", metrics)
+    telemetry_key = metrics.register_active_request(
+        request_id="req_masked_diffusion",
+        model="demo-masked-diffusion",
+        prompt_tokens=4,
+    )
+    metrics.bind_active_request(telemetry_key, 29)
+    monkeypatch.setattr(
+        server_generation, "wired_limit", lambda *args, **kwargs: nullcontext()
+    )
+
+    class StoppingCriteria:
+        def reset(self, eos_token_id):
+            self.eos_token_id = eos_token_id
+
+        def __call__(self, token):
+            return False
+
+    class LanguageModel:
+        def generate(self, input_ids, *, stats, on_block, **kwargs):
+            stats["prompt_time"] = 0.01
+            assert on_block([41, 42]) is True
+            assert on_block([41, 42, 43]) is True
+            return mx.array([[41, 42, 43]], dtype=mx.int32)
+
+    tokenizer = SimpleNamespace(
+        stopping_criteria=StoppingCriteria(),
+        decode=lambda tokens, skip_special_tokens=True: "".join(map(str, tokens)),
+    )
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = SimpleNamespace(language_model=LanguageModel())
+    gen.processor = object()
+    gen.tokenizer = tokenizer
+    gen.config = SimpleNamespace(eos_token_id=99)
+    gen._drain_cancellations = lambda: set()
+    rqueue = Queue()
+
+    gen._generate_masked_diffusion(
+        29,
+        rqueue,
+        {"input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32)},
+        server.GenerationArguments(max_tokens=3),
+        set(),
+        telemetry_key,
+        4,
+    )
+
+    live = metrics.snapshot()["active_requests"][0]
+    assert live["generated_tokens"] == 3
+    assert (
+        sum(item.kwargs["count"] for item in record_generation_tokens.call_args_list)
+        == 3
+    )
+    chunks = [rqueue.get(timeout=1), rqueue.get(timeout=1), rqueue.get(timeout=1)]
+    assert [chunk.token_count for chunk in chunks] == [2, 1, 0]
+    assert chunks[-1].finish_reason == "length"
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):
@@ -1976,6 +2192,7 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     ):
         response = client.post(
             "/chat/completions",
+            headers={"X-Finn-Request-ID": "req_stream_telemetry"},
             json={
                 "model": "demo",
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -1995,6 +2212,7 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].min_p == 0.08
     assert captured["args"].repetition_penalty == 1.15
     assert captured["args"].logit_bias == {12: -1.5}
+    assert captured["args"].telemetry_request_id == "req_stream_telemetry"
 
 
 def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
@@ -3216,11 +3434,142 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     payload = response.json()
     assert payload["latest"] is None
     assert payload["recent"] == []
+    assert payload["active_requests"] == []
     assert payload["summary"]["requests_started"] == 0
     assert payload["summary"]["requests_completed"] == 0
     assert payload["summary"]["requests_failed"] == 0
     assert payload["server"]["loaded_model"] is None
+    assert payload["server"]["prefill_step_size"] > 0
+    assert payload["server"]["telemetry"] == {
+        "schema_version": 1,
+        "active_request_feed": True,
+        "request_correlation": "upstream_request_id",
+        "generation_token_count_source": "model_token_ids",
+        "exact_generation_tokens": True,
+        "prefill_rates": ["instant", "average"],
+        "decode_rates": ["instant", "average"],
+    }
     assert payload["server"]["apc"] == {"enabled": False}
+
+
+def test_server_metrics_store_exposes_request_owned_live_counters():
+    metrics = server.ServerMetricsStore()
+    key = metrics.register_active_request(
+        request_id="req_live_telemetry",
+        model="demo-model",
+        prompt_tokens=8192,
+    )
+    sibling_key = metrics.register_active_request(
+        request_id="req_live_telemetry",
+        model="demo-model",
+        prompt_tokens=128,
+    )
+    metrics.bind_active_request(key, 17)
+
+    queued_rows = metrics.snapshot()["active_requests"]
+    assert len({row["request_id"] for row in queued_rows}) == 2
+    assert {row["upstream_request_id"] for row in queued_rows} == {"req_live_telemetry"}
+    queued = next(row for row in queued_rows if row["uid"] == 17)
+    assert queued["request_id"].startswith("mlxreq-")
+    assert queued["request_id"] != queued["upstream_request_id"]
+    assert queued["upstream_request_id"] == "req_live_telemetry"
+    assert queued["request_id_source"] == "x-finn-request-id"
+    assert queued["uid"] == 17
+    assert queued["status"] == "queued"
+    assert queued["prompt_tokens_processed"] == 0
+
+    metrics.record_active_prompt_progress(
+        key,
+        prompt_tokens=8192,
+        prompt_tokens_processed=2048,
+        prompt_tokens_computed=2048,
+        cached_tokens=0,
+        prefill_elapsed_s=2.0,
+        prefill_tok_s=1024.0,
+        prefill_complete=False,
+        prefill_window_ready=True,
+    )
+    metrics.record_active_prompt_progress(
+        key,
+        prompt_tokens=8192,
+        prompt_tokens_processed=4096,
+        prompt_tokens_computed=3072,
+        cached_tokens=1024,
+        prefill_elapsed_s=2.5,
+        prefill_tok_s=1228.8,
+        prefill_complete=False,
+        prefill_window_ready=True,
+    )
+    metrics.record_active_generation_tokens(
+        key,
+        count=2,
+        decode_compute_s=0.1,
+    )
+    metrics.record_active_generation_tokens(
+        key,
+        count=3,
+        decode_compute_s=0.05,
+    )
+
+    live = next(
+        row for row in metrics.snapshot()["active_requests"] if row["uid"] == 17
+    )
+    assert live["status"] == "generating"
+    assert live["prompt_tokens_processed"] == 4096
+    assert live["prompt_tokens_computed"] == 3072
+    assert live["cached_tokens"] == 1024
+    assert live["prefill_tok_s"] == 1228.8
+    assert live["prefill_tok_s_avg"] == 1228.8
+    assert live["prefill_tok_s_inst"] == pytest.approx(2048.0)
+    assert live["prefill_complete"] is False
+    assert live["prefill_window_ready"] is True
+    assert live["generated_tokens"] == 5
+    assert live["decode_tok_s"] == pytest.approx(5 / 0.15)
+    assert live["decode_tok_s_avg"] == pytest.approx(5 / 0.15)
+    assert live["decode_tok_s_inst"] == pytest.approx(60.0)
+    assert live["decode_window_ready"] is True
+    assert live["token_count_source"] == "model_token_ids"
+    assert live["exact_generation_tokens"] is True
+
+    metrics.retire_active_request(key)
+    metrics.retire_active_request(sibling_key)
+    assert metrics.snapshot()["active_requests"] == []
+
+
+def test_prompt_progress_reports_distinct_per_row_processed_tokens():
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch._prompt_time_s = 2.0
+    batch._prompt_uids = [11, 12]
+    batch._prompt_tokens_per_row = [8192, 4096]
+    batch._cached_tokens_per_row = [512, 0]
+    batch._processed_prompt_columns = 2048
+    batch._left_padding_per_row = [0, 4096]
+    batch._right_pad_per_row = None
+    batch._suffix_lens = [8192, 4096]
+    batch._apc_meta = [{}, {}]
+
+    first, second = batch.prompt_progress()
+
+    assert first.prompt_tokens_processed == 2560
+    assert first.prompt_tokens_computed == 2048
+    assert first.prompt_tps == pytest.approx(1024.0)
+    assert first.prefill_complete is False
+    assert first.prefill_window_ready is True
+    assert second.prompt_tokens_processed == 0
+    assert second.prompt_tokens_computed == 0
+    assert second.prompt_tps == 0.0
+    assert second.prefill_complete is False
+    assert second.prefill_window_ready is False
+
+    batch._processed_prompt_columns = 8192
+    first, second = batch.prompt_progress()
+
+    assert first.prompt_tokens_processed == 8192
+    assert first.prompt_tokens_computed == 7680
+    assert first.prefill_complete is True
+    assert second.prompt_tokens_processed == 4096
+    assert second.prompt_tokens_computed == 4096
+    assert second.prefill_complete is True
 
 
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
@@ -4247,6 +4596,67 @@ class TestResponseGenerator:
         assert item.prompt_tps == pytest.approx(184.431)
         assert item.cached_tokens == 7
         assert rqueue.get() is None
+
+    def test_step_counts_model_tokens_before_empty_text_suppression(self, monkeypatch):
+        class EmptyTextStreamer:
+            def advance(self, token, finish_reason=None):
+                return ""
+
+            def finalize(self):
+                return ""
+
+        class ExactTokenBatch:
+            def next(self, **kwargs):
+                return (
+                    [
+                        SimpleNamespace(
+                            uid=9,
+                            prompt_tokens=4096,
+                            prompt_tokens_processed=2048,
+                            prompt_tps=1024.0,
+                            prompt_time=2.0,
+                            cached_tokens=0,
+                            prefill_window_ready=True,
+                        )
+                    ],
+                    [
+                        SimpleNamespace(
+                            uid=9,
+                            token=token,
+                            token_logprob=0.0,
+                            finish_reason=None,
+                        )
+                        for token in (101, 102, 103)
+                    ],
+                )
+
+        metrics = server.ServerMetricsStore()
+        monkeypatch.setattr(server.runtime, "metrics", metrics)
+        key = metrics.register_active_request(
+            request_id="req_hidden_tokens",
+            model="demo",
+            prompt_tokens=4096,
+        )
+        metrics.bind_active_request(key, 9)
+        rqueue = Queue()
+        active = {
+            9: {
+                "rqueue": rqueue,
+                "streamer": EmptyTextStreamer(),
+                "telemetry_key": key,
+                "prompt_tps": None,
+                "cached_tokens": 0,
+            }
+        }
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+
+        gen._step(ExactTokenBatch(), active)
+
+        live = metrics.snapshot()["active_requests"][0]
+        assert live["prompt_tokens_processed"] == 2048
+        assert live["generated_tokens"] == 3
+        assert live["decode_window_ready"] is True
+        assert [rqueue.get().text for _ in range(3)] == ["", "", ""]
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits

@@ -796,9 +796,13 @@ class PromptProgress:
 
     uid: int
     prompt_tokens: int
+    prompt_tokens_processed: int = 0
+    prompt_tokens_computed: int = 0
     prompt_tps: float = 0.0
     prompt_time: float = 0.0
     cached_tokens: int = 0
+    prefill_complete: bool = False
+    prefill_window_ready: bool = False
 
 
 def _sample_with_positions(
@@ -1685,8 +1689,23 @@ class PromptProcessingBatch:
         return next_col
 
     def _row_real_tokens_processed(self, batch_idx: int) -> int:
-        meta = self._apc_meta[batch_idx]
-        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        cached_tokens_per_row = getattr(self, "_cached_tokens_per_row", [])
+        meta = (
+            self._apc_meta[batch_idx]
+            if batch_idx < len(self._apc_meta) and self._apc_meta[batch_idx]
+            else {}
+        )
+        prefix_len = int(
+            meta.get(
+                "prefix_len",
+                (
+                    cached_tokens_per_row[batch_idx]
+                    if batch_idx < len(cached_tokens_per_row)
+                    else 0
+                ),
+            )
+            or 0
+        )
         if self._right_pad_per_row is not None:
             suffix_done = min(
                 self._suffix_lens[batch_idx],
@@ -1768,22 +1787,37 @@ class PromptProcessingBatch:
         self._prompt_time_s += max(0.0, float(elapsed_s))
 
     def prompt_progress(self) -> List[PromptProgress]:
-        if self._prompt_time_s <= 0:
-            return []
-        return [
-            PromptProgress(
-                uid=uid,
-                prompt_tokens=prompt_tokens,
-                prompt_tps=prompt_tokens / self._prompt_time_s,
-                prompt_time=self._prompt_time_s,
-                cached_tokens=cached_tokens,
-            )
-            for uid, prompt_tokens, cached_tokens in zip(
+        rows = []
+        for batch_idx, (uid, prompt_tokens, cached_tokens) in enumerate(
+            zip(
                 self._prompt_uids,
                 self._prompt_tokens_per_row,
                 self._cached_tokens_per_row,
             )
-        ]
+        ):
+            processed = min(
+                prompt_tokens,
+                max(cached_tokens, self._row_real_tokens_processed(batch_idx)),
+            )
+            computed = max(0, processed - cached_tokens)
+            rows.append(
+                PromptProgress(
+                    uid=uid,
+                    prompt_tokens=prompt_tokens,
+                    prompt_tokens_processed=processed,
+                    prompt_tokens_computed=computed,
+                    prompt_tps=(
+                        computed / self._prompt_time_s
+                        if computed > 0 and self._prompt_time_s > 0
+                        else 0.0
+                    ),
+                    prompt_time=self._prompt_time_s,
+                    cached_tokens=cached_tokens,
+                    prefill_complete=processed >= prompt_tokens,
+                    prefill_window_ready=computed > 0,
+                )
+            )
+        return rows
 
     def generate(
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
@@ -1801,6 +1835,10 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        # The final forward consumes every remaining prompt column. Recording
+        # it here lets the server publish exact per-row prompt completion at
+        # the prefill-to-generation handoff instead of waiting for SSE output.
+        self._processed_prompt_columns += int(self._inputs_embeds.shape[1])
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
@@ -2083,6 +2121,9 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        prompt_progress_callback: Optional[
+            Callable[[List[PromptProgress]], None]
+        ] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2098,6 +2139,7 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
+        self.prompt_progress_callback = prompt_progress_callback
         if self.draft_model is not None:
             compute_logprobs = False
             top_logprobs_k = 0
@@ -2141,6 +2183,7 @@ class BatchGenerator:
         self._prompt_time_counter = 0
         self._gen_tokens_counter = 0
         self._steps_counter = 0
+        self._last_generation_step_time_s = 0.0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
 
         self._wire_stack = contextlib.ExitStack()
@@ -2596,6 +2639,14 @@ class BatchGenerator:
             return progress()
         return []
 
+    def _notify_prompt_progress(self, prompt_batch) -> None:
+        callback = getattr(self, "prompt_progress_callback", None)
+        if not callable(callback):
+            return
+        progress = self._prompt_batch_progress(prompt_batch)
+        if progress:
+            callback(progress)
+
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
             self._generation_batch = gen_batch
@@ -2605,10 +2656,15 @@ class BatchGenerator:
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
+        self._last_generation_step_time_s = 0.0
 
         # Decode-first: always emit a generation step before touching prefill.
         if len(self._generation_batch) > 0:
+            generation_started = time.perf_counter()
             generation_responses = self._generation_batch.next()
+            self._last_generation_step_time_s = max(
+                0.0, time.perf_counter() - generation_started
+            )
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if (
@@ -2633,14 +2689,17 @@ class BatchGenerator:
 
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
+                self._notify_prompt_progress(self._prompt_batch)
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 self._prompt_tokens_counter += n
+                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 return prompt_responses, generation_responses
 
+            self._notify_prompt_progress(self._prompt_batch)
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
                 self.sampler,
@@ -2678,12 +2737,15 @@ class BatchGenerator:
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
+                    self._notify_prompt_progress(self._prompt_batch)
                     tic = time.perf_counter()
                     nstep = self._prompt_batch.prompt_step()
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 else:
+                    self._notify_prompt_progress(self._prompt_batch)
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
                         self.sampler,
@@ -2743,12 +2805,15 @@ class BatchGenerator:
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
             if self._prompt_batch.needs_processing():
+                self._notify_prompt_progress(self._prompt_batch)
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
             else:
+                self._notify_prompt_progress(self._prompt_batch)
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
                     self.sampler,
